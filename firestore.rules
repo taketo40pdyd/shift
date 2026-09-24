@@ -1,0 +1,111 @@
+rules_version = '2';
+
+// シフト管理 — Firestore セキュリティルール
+//
+// users/{uid}                          … プロフィール（本人のみ）
+// users/{uid}/locations/{locationId}   … 拠点ごとのシフトデータ（本人のみ・JSON文字列で保存）
+// shares/{shareId}                     … スタッフ用共有リンク（リンクを知っている人だけ読める／作成者だけ書ける）
+// shares/{shareId}/requests/{YYYY-MM}  … スタッフが提出した希望（受付中の月だけ書ける／作成者だけ一覧できる）
+//
+// ・匿名ログイン（ゲスト）も自分の uid の下にだけ保存できる
+// ・時刻はすべて serverTimestamp()（端末の時計を信用しない）
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- 共通 ----------
+    function signedIn() { return request.auth != null; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+    function isAnonymous() { return request.auth.token.firebase.sign_in_provider == 'anonymous'; }
+    function incoming() { return request.resource.data; }
+    function isServerTime(field) { return incoming()[field] == request.time; }
+    function optString(field, max) {
+      return !(field in incoming()) || (incoming()[field] is string && incoming()[field].size() <= max);
+    }
+
+    // ---------- users/{uid} ----------
+    function validUser() {
+      return incoming().keys().hasOnly(['createdAt', 'updatedAt', 'displayName'])
+        && incoming().keys().hasAll(['createdAt', 'updatedAt'])
+        && incoming().createdAt is timestamp
+        && isServerTime('updatedAt')
+        && optString('displayName', 100);
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid) && validUser() && isServerTime('createdAt');
+      allow update: if isOwner(uid) && validUser() && incoming().createdAt == resource.data.createdAt;
+      allow delete: if isOwner(uid) && !isAnonymous();
+
+      // ---------- users/{uid}/locations/{locationId} ----------
+      function validLocation() {
+        return incoming().keys().hasOnly(['name', 'data', 'order', 'deviceId', 'updatedAt', 'schemaVersion'])
+          && incoming().keys().hasAll(['name', 'data', 'updatedAt'])
+          && incoming().name is string && incoming().name.size() > 0 && incoming().name.size() <= 50
+          && incoming().data is string && incoming().data.size() <= 950000
+          && (!('order' in incoming()) || incoming().order is int)
+          && optString('deviceId', 40)
+          && (!('schemaVersion' in incoming()) || incoming().schemaVersion is int)
+          && isServerTime('updatedAt');
+      }
+      match /locations/{locationId} {
+        allow read: if isOwner(uid);
+        allow create, update: if isOwner(uid) && locationId.size() <= 64 && validLocation();
+        allow delete: if isOwner(uid);
+      }
+    }
+
+    // ---------- shares/{shareId} ----------
+    function validShare() {
+      return incoming().keys().hasOnly(['ownerUid', 'locationName', 'staffName', 'empId', 'shiftTypes', 'shifts', 'notes',
+                                        'acceptRequests', 'requestMonth', 'deadline', 'rangeStart', 'rangeEnd', 'revoked', 'updatedAt'])
+        && incoming().ownerUid == request.auth.uid
+        && incoming().staffName is string && incoming().staffName.size() <= 50
+        && incoming().locationName is string && incoming().locationName.size() <= 50
+        && incoming().empId is string && incoming().empId.size() <= 64
+        && incoming().shiftTypes is list && incoming().shiftTypes.size() <= 30
+        && incoming().shifts is map && incoming().shifts.size() <= 200
+        && incoming().notes is map && incoming().notes.size() <= 200
+        && incoming().acceptRequests is bool
+        && incoming().requestMonth is string && (incoming().requestMonth == '' || incoming().requestMonth.matches('^[0-9]{4}-[0-9]{2}$'))
+        && incoming().deadline is string && incoming().deadline.size() <= 10
+        && incoming().rangeStart is string && incoming().rangeEnd is string
+        && incoming().revoked is bool
+        && isServerTime('updatedAt');
+    }
+
+    match /shares/{shareId} {
+      // リンク（推測できない長いID）を知っている人だけが1件ずつ読める。一覧取得は不可
+      allow get: if shareId.size() >= 16;
+      allow list: if false;
+      allow create: if signedIn() && validShare();
+      allow update: if signedIn() && resource.data.ownerUid == request.auth.uid && validShare();
+      allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
+
+      // ---------- shares/{shareId}/requests/{month} ----------
+      function share() { return get(/databases/$(database)/documents/shares/$(shareId)).data; }
+      function validRequest(month) {
+        return incoming().keys().hasOnly(['days', 'comment', 'staffName', 'submittedAt'])
+          && incoming().days is map && incoming().days.size() <= 31
+          && optString('comment', 500)
+          && optString('staffName', 50)
+          && isServerTime('submittedAt')
+          && share().acceptRequests == true
+          && share().revoked == false
+          && share().requestMonth == month;
+      }
+      match /requests/{month} {
+        allow get: if signedIn();
+        allow list: if signedIn() && share().ownerUid == request.auth.uid;
+        allow create, update: if signedIn() && validRequest(month);
+        allow delete: if signedIn() && share().ownerUid == request.auth.uid;
+      }
+    }
+
+    // ---------- それ以外はすべて拒否 ----------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
